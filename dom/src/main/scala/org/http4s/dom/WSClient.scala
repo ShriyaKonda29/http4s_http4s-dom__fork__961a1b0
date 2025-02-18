@@ -26,6 +26,8 @@ import cats.effect.std.Queue
 import cats.effect.syntax.all._
 import cats.syntax.all._
 import fs2.INothing
+import scala.concurrent.duration._
+import java.util.concurrent.TimeoutException
 import org.http4s.Method
 import org.http4s.client.websocket.WSDataFrame
 import org.http4s.client.websocket.WSFrame
@@ -42,8 +44,12 @@ final class WSException private[dom] (
 ) extends RuntimeException(reason)
 
 object WSClient {
+  def apply[F[_]](implicit F: Async[F]): WSClient[F] = WSClientBuilder[F].create
+  private[dom] def makeClient[F[_]](
+      connectionTimeout: Duration,
+      operationTimeout: Duration
+  )(implicit F: Async[F]): WSClient[F] = new WSClient[F] {
 
-  def apply[F[_]](implicit F: Async[F]): WSClient[F] = new WSClient[F] {
     def connectHighLevel(request: WSRequest): Resource[F, WSConnection[F]] =
       for {
         dispatcher <- Dispatcher[F]
@@ -83,7 +89,14 @@ object WSClient {
             ws.onclose = e =>
               dispatcher.unsafeRunAndForget(
                 F.delay(println("closed")) *> messages.offer(None) *> close.complete(e))
-          }
+          }.timeoutTo(
+            connectionTimeout match {
+              case d: FiniteDuration => d
+              case _ => 30.seconds // Default timeout if none specified
+            },
+            F.raiseError(new TimeoutException(
+              s"WebSocket connection to ${request.uri.renderString} timed out after ${connectionTimeout.toMillis} ms"))
+          )
         } {
           case (ws, exitCase) =>
             val reason = exitCase match {
@@ -104,13 +117,20 @@ object WSClient {
             }
 
             F.async_[CloseEvent] { cb =>
-              ws.onerror = e => cb(Left(js.JavaScriptException(e)))
-              ws.onclose = e => cb(Right(e))
+              val socket = ws.asInstanceOf[WebSocket]
+              socket.onerror = e => cb(Left(js.JavaScriptException(e)))
+              socket.onclose = e => cb(Right(e))
               reason match { // 1000 "normal closure" is only code supported in browser
-                case Some(reason) => ws.close(1000, reason)
-                case None => ws.close(1000)
+                case Some(reason) => socket.close(1000, reason)
+                case None => socket.close(1000)
               }
-            }.flatMap(close.complete(_)) *> messages.offer(None)
+            }.timeoutTo(
+              operationTimeout match {
+                case d: FiniteDuration => d
+                case _ => 30.seconds // Default timeout if none specified
+              },
+              F.raiseError(new TimeoutException("WebSocket close operation timed out"))
+            ).flatMap(close.complete(_)) *> messages.offer(None)
         }
       } yield new WSConnection[F] {
 
@@ -119,19 +139,29 @@ object WSClient {
         def receive: F[Option[WSDataFrame]] =
           drained
             .get
-            .race(messages.take.flatMap[Option[WSDataFrame]] {
-              case None => drained.complete(()).as(none)
-              case Some(e) =>
-                e.data match {
-                  case s: String => WSFrame.Text(s).some.pure.widen
-                  case b: js.typedarray.ArrayBuffer =>
-                    WSFrame.Binary(ByteVector.fromJSArrayBuffer(b)).some.pure.widen
-                  case _ =>
-                    F.raiseError(
-                      new WSException(s"Unsupported data: ${js.typeOf(e.data)}")
-                    )
-                }
-            })
+            .race(
+              messages
+                .take
+                .timeoutTo(
+                  operationTimeout match {
+                    case d: FiniteDuration => d
+                    case _ => 30.seconds // Default timeout if none specified
+                  },
+                  F.raiseError(new TimeoutException("WebSocket receive operation timed out"))
+                )
+                .flatMap[Option[WSDataFrame]] {
+                  case None => drained.complete(()).as(none)
+                  case Some(e) =>
+                    e.data match {
+                      case s: String => WSFrame.Text(s).some.pure.widen
+                      case b: js.typedarray.ArrayBuffer =>
+                        WSFrame.Binary(ByteVector.fromJSArrayBuffer(b)).some.pure.widen
+                      case _ =>
+                        F.raiseError(
+                          new WSException(s"Unsupported data: ${js.typeOf(e.data)}")
+                        )
+                    }
+                })
             .map(_.toOption.flatten)
             .race(error.get.rethrow)
             .map(_.merge)
@@ -139,8 +169,24 @@ object WSClient {
         def send(wsf: WSDataFrame): F[Unit] = errorOr {
           println("send msg")
           wsf match {
-            case WSFrame.Text(data, true) => F.delay(ws.send(data))
-            case WSFrame.Binary(data, true) => F.delay(ws.send(data.toJSArrayBuffer))
+            case WSFrame.Text(text, true) => 
+              F.delay(ws.send(text))
+                .timeoutTo(
+                  operationTimeout match {
+                    case d: FiniteDuration => d
+                    case _ => 30.seconds // Default timeout if none specified
+                  },
+                  F.raiseError(new TimeoutException("WebSocket send operation timed out"))
+                )
+            case WSFrame.Binary(binary, true) => 
+              F.delay(ws.send(binary.toJSArrayBuffer))
+                .timeoutTo(
+                  operationTimeout match {
+                    case d: FiniteDuration => d
+                    case _ => 30.seconds // Default timeout if none specified
+                  },
+                  F.raiseError(new TimeoutException("WebSocket send operation timed out"))
+                )
             case _ =>
               F.raiseError(new IllegalArgumentException("DataFrames cannot be fragmented"))
           }

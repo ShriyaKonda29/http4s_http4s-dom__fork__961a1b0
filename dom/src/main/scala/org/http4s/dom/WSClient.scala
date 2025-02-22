@@ -30,6 +30,8 @@ import org.http4s.Method
 import org.http4s.client.websocket.WSDataFrame
 import org.http4s.client.websocket.WSFrame
 import org.http4s.client.websocket.WSRequest
+import scala.concurrent.duration._
+import java.util.concurrent.TimeoutException
 import org.scalajs.dom.CloseEvent
 import org.scalajs.dom.MessageEvent
 import org.scalajs.dom.WebSocket
@@ -42,6 +44,7 @@ final class WSException private[dom] (
 ) extends RuntimeException(reason)
 
 object WSClient {
+  private val DefaultCloseTimeout: FiniteDuration = 10.seconds
 
   def apply[F[_]](implicit F: Async[F]): WSClient[F] = new WSClient[F] {
     def connectHighLevel(request: WSRequest): Resource[F, WSConnection[F]] =
@@ -110,7 +113,12 @@ object WSClient {
                 case Some(reason) => ws.close(1000, reason)
                 case None => ws.close(1000)
               }
-            }.flatMap(close.complete(_)) *> messages.offer(None)
+            }.timeoutTo(
+              DefaultCloseTimeout,
+              F.raiseError[CloseEvent](new TimeoutException(
+                s"WebSocket close operation timed out after ${DefaultCloseTimeout.toMillis} ms"
+              ))
+            ).flatMap(close.complete(_)) *> messages.offer(None)
         }
       } yield new WSConnection[F] {
 

@@ -47,4 +47,13 @@ class WebSocketSuite extends CatsEffectSuite {
       )
   }
 
+  test("close timeout") {
+    WSClient[IO]
+      .connectHighLevel(
+        WSRequest(Uri.fromString(s"ws://localhost:${fileServicePort}/ws").toOption.get)
+      )
+      .use { conn => conn.send(WSFrame.Text("close_without_response")) }
+      .intercept[TimeoutException]
+  }
+
 }
